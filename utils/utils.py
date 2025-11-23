@@ -513,12 +513,13 @@ class ISIC_Multimodal_Dataset(Dataset):
     """
     def __init__(self, hdf5_path: str, metadata_df: pd.DataFrame,
                  image_transform, data_augmentation_trans = None,
-                 augment_positives:bool=False):
+                 augment_positives:bool=False, static_aug_multiplier: int = 0):
         
         self.augment_trans = data_augmentation_trans    # transformation to data augmentation
         self.prep_trans = image_transform               # transformation base
         self.metadata_processor = MetadataProcessor(metadata_df)
         self.augment_positives = augment_positives    # apply dinamic transformations
+        self.static_aug_multiplier = static_aug_multiplier
 
         # 1º Read the metadata
         self.metadata = metadata_df
@@ -531,6 +532,28 @@ class ISIC_Multimodal_Dataset(Dataset):
         # 3º Preprocess the metadata
         self.metadata_features = self.metadata_processor.process_metadata(self.metadata)
 
+        # 4º Static data augmentation
+        if self.static_aug_multiplier > 0:
+            self._generate_static_augmentations()
+
+    def _generate_static_augmentations(self):
+        positive_samples = self.metadata[self.metadata['target'] == 1]
+
+        if len(positive_samples) == 0:
+            print("No positive samples found, skipping static augmentation.")
+            return
+
+        # Replicate positive rows in the metadata DataFrame
+        augmented_positives = pd.concat([positive_samples] * self.static_aug_multiplier, ignore_index=True)
+        self.metadata = pd.concat([self.metadata, augmented_positives], ignore_index=True)
+
+        # Replicate the corresponding metadata_features BEFORE concatenar
+        pos_indices = np.where(self.metadata['target'][:len(self.metadata) - len(augmented_positives)] == 1)[0]
+        pos_features = self.metadata_features[pos_indices]
+        augmented_features = np.tile(pos_features, (self.static_aug_multiplier, 1))
+        self.metadata_features = np.vstack([self.metadata_features, augmented_features])
+
+        print(f"Added {len(augmented_positives)} augmented positive samples")
 
     def __len__(self):
         return len(self.metadata)
