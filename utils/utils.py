@@ -179,8 +179,8 @@ def plot_dataset_comparison_subplots(stats_dicts, labels=["Train", "Validation",
         for stats in stats_dicts:
             cls_stats = stats["metadata"]["numeric"].get(feature)
             if cls_stats and str(cls) in cls_stats:
-                means.append(cls_stats[str(cls)]["mean"])
-                stds.append(cls_stats[str(cls)]["std"])
+                means.append(cls_stats[cls]["mean"])
+                stds.append(cls_stats[cls]["std"])
             else:
                 means.append(0)
                 stds.append(0)
