@@ -369,14 +369,14 @@ class MetadataProcessor:
             if f in df.columns:
                 col = pd.to_numeric(df[f], errors='coerce')
 
-                # Missing indicator (1 if missing, 0 if present)
+                # Missing indicator
                 missing_indicator = col.isna().astype(np.float32).values.reshape(-1, 1)
                 processed.append(missing_indicator)
 
-                # Fill missing with training mean
+                # Fill missing
                 col = col.fillna(self.numeric_means[f])
 
-                # Standardize
+                # Normalize
                 z = ((col - self.numeric_means[f]) / self.numeric_stds[f]).values.reshape(-1, 1).astype(np.float32)
                 processed.append(z)
 
@@ -386,12 +386,17 @@ class MetadataProcessor:
                 dummies = pd.get_dummies(df[f], prefix=f, dummy_na=True)
                 expected_cols = self.categorical_columns[f]
 
-                # Add missing columns
-                for col in expected_cols:
-                    if col not in dummies.columns:
-                        dummies[col] = 0
+                # Efficiently add missing columns in one shot
+                missing_cols = [c for c in expected_cols if c not in dummies.columns]
+                if missing_cols:
+                    add_df = pd.DataFrame(
+                        0, 
+                        index=dummies.index, 
+                        columns=missing_cols
+                    )
+                    dummies = pd.concat([dummies, add_df], axis=1)
 
-                # Reorder columns
+                # Reorder
                 dummies = dummies[expected_cols]
                 processed.append(dummies.values.astype(np.float32))
 
@@ -437,7 +442,8 @@ class TrainableModule():
         self.device = device
         self.criterion = criterion
         self.to(device)
-        self.optimizer = Adam(self.parameters(), lr=1e-4)
+        self.lr = 1e-4
+        self.optimizer = Adam(self.parameters(), lr=self.lr)
         self.best_model = None
         self.best_model_AUC = 0
 
@@ -582,7 +588,7 @@ class TrainableModule():
 
     # -------------------------------------------------------------
     def save(self, path):
-        print(f"Saved model with val_auc {self.best_model_AUC }")
+        print(f"Saved model with val_auc {self.best_model_AUC}")
         torch.save(self.best_model, path)
     
 class ISIC_Multimodal_Dataset(Dataset):
@@ -646,14 +652,14 @@ class ISIC_Multimodal_Dataset(Dataset):
         image_rgb = self._load_image_from_hdf5(isic_id)
         
         # Dynamic positive augmentation
+        image_pil = F_v.to_pil_image(image_rgb)
+        
         if self.augment_positives and self.is_labelled and row["target"] == 1:
-            image_pil = F_v.to_pil_image(image_rgb)
-            image_aug = self.augment_trans(image_pil)
-            image = self.prep_trans(image_aug)  # apply base trans
+            image = self.augment_trans(image_pil)
         else:
-            image_pil = F_v.to_pil_image(image_rgb)
             image = self.prep_trans(image_pil)
 
+        # Metadata
         metadata = torch.FloatTensor(self.metadata_features[idx])
 
         if self.is_labelled:
