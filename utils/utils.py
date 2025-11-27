@@ -9,8 +9,7 @@ from albumentations.core.transforms_interface import ImageOnlyTransform
 import albumentations as A
 from tqdm import tqdm
 import torch.nn as nn
-from torch.cuda import amp
-from torch.optim import Adam
+from torch.optim import AdamW
 from sklearn.metrics import roc_auc_score
 from torch.utils.data import Sampler
 from torch.utils.data import Dataset
@@ -661,7 +660,17 @@ class TrainableModule():
         self.criterion = criterion
         self.to(device)
         self.lr = 1e-4
-        self.optimizer = Adam(self.parameters(), lr=self.lr)
+        self.optimizer = AdamW(self.parameters(), lr=self.lr, weight_decay=1e-4)
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer,
+            mode='max',            # maximize AUC
+            factor=0.5,
+            patience=2,
+            min_lr=1e-7,
+            verbose=True
+        )
+
+        
         self.best_model = None
         self.best_model_AUC = 0
 
@@ -742,6 +751,7 @@ class TrainableModule():
         preds = torch.cat(preds_list).sigmoid().numpy()
         labels = torch.cat(labels_list).numpy()
         auc = roc_auc_score(labels, preds)
+        self.scheduler.step(auc)
 
         return total_loss / len(loader), auc
     # -------------------------------------------------------------
@@ -808,6 +818,46 @@ class TrainableModule():
                 return True
 
         return False
+
+    # -------------------------------------------------------------
+    def submit_kaggle(self, test_loader, submission_file="submission.csv"):
+        """
+        Generate Kaggle submission CSV using ensemble predictions.
+
+        Parameters:
+        -----------
+        test_loader : DataLoader
+            Test dataset loader. Should yield (images, metadata, isic_ids) or (images, isic_ids)
+        submission_file : str
+            Output CSV filename
+
+        Returns:
+        --------
+        submission_df : pd.DataFrame
+            DataFrame containing 'isic_id' and 'target' columns
+        """
+        self.eval()
+        predictions = []
+
+        with torch.no_grad():
+            for images, metadata, isic_ids in tqdm(test_loader, desc="Inference on Test"):
+                images = images.to(self.device, non_blocking=True)
+                metadata = metadata.to(self.device, non_blocking=True)
+
+                # with amp.autocast(device_type=self.device.type):  # AMP
+                logits = self(images, metadata).squeeze()
+                probs = torch.sigmoid(logits)
+                
+                probs = probs.cpu().numpy()
+                for isic_id, p in zip(isic_ids, probs):
+                    predictions.append({"isic_id": isic_id, "target": float(p)})
+
+        submission_df = pd.DataFrame(predictions)
+        submission_df = submission_df.sort_values(by="isic_id").reset_index(drop=True)
+        submission_df.to_csv(submission_file, index=False)
+
+        print(f"Saved submission with {len(submission_df)} rows to {submission_file}")
+        display(submission_df.head(10))
 
     # -------------------------------------------------------------
     def save(self, path):
