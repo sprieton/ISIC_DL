@@ -1,26 +1,65 @@
 import h5py
 import cv2
+import os
+import random
 import numpy as np
 import pandas as pd
 import torch
+from albumentations.core.transforms_interface import ImageOnlyTransform
+import albumentations as A
 from tqdm import tqdm
 import torch.nn as nn
 from torch.cuda import amp
 from torch.optim import Adam
 from sklearn.metrics import roc_auc_score
 from torch.utils.data import Sampler
-import torchvision.transforms.functional as F_v
 from torch.utils.data import Dataset
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import GridSearchCV
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
+from sklearn.experimental import enable_iterative_imputer
+from sklearn.impute import IterativeImputer
+import optuna
+import lightgbm as lgb
+import numpy as np
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import roc_auc_score
+import joblib
+import warnings
+
 
 
 ################################################################################
                                 # TOOLS #
 ################################################################################
+def make_sampler_weights(targets, p_target):
+    "give the weights for the weighted sampler"
+    n_pos = (targets == 1).sum()
+    n_neg = (targets == 0).sum()
+    # sampler class weights (w_neg=1)
+    w_pos = (p_target / (1 - p_target)) * (n_neg / n_pos)
+    class_weights = np.array([1.0, w_pos], dtype=float)
+    sample_weights = np.array([class_weights[int(t)] for t in targets], dtype=float)
+    
+    return sample_weights
+
+def remove_last_layer(model):
+    """
+    Erase the last layer of the model
+    """
+    last_linear_or_conv = None
+    
+    # Recorrer todos los módulos hijos
+    for name, module in model.named_children():
+        if isinstance(module, (nn.Linear, nn.Conv2d)):
+            last_linear_or_conv = name
+    
+    if last_linear_or_conv is not None:
+            setattr(model.backbone, last_linear_or_conv, nn.Identity())
+    
+    return model
 
 def create_balanced_split(metadataCSV_path: str, neg_multiplier: int = 10,
                           val_frac: float = 0.2, seed: int = 42):
@@ -312,99 +351,278 @@ def get_best_metadata(train_df: pd.DataFrame, test_df: pd.DataFrame,
 
     return best_features
 
+class AdvancedHairAugmentation(ImageOnlyTransform):
+    def __init__(self, hairs: int = 4, hairs_folder: str = "", always_apply=False, p=0.5):
+        super().__init__(always_apply=always_apply, p=p)
+        self.hairs = hairs
+        self.hairs_folder = hairs_folder
+
+    def apply(self, image, **params):
+        n_hairs = random.randint(0, self.hairs)
+        if n_hairs == 0:
+            return image
+
+        H, W, _ = image.shape
+
+        # List hair images
+        hair_files = [im for im in os.listdir(self.hairs_folder) if im.endswith(".png")]
+        if not hair_files:
+            return image
+
+        for _ in range(n_hairs):
+            # Load & random flip/rotate
+            hair = cv2.imread(os.path.join(self.hairs_folder, random.choice(hair_files)))
+            if hair.shape[2] == 4:
+                hair = hair[:, :, :3]
+            hair = cv2.cvtColor(hair, cv2.COLOR_BGR2RGB)
+
+            # Random flip & rotation
+            hair = cv2.flip(hair, random.choice([-1, 0, 1]))
+            hair = cv2.rotate(hair, random.choice([0, 1, 2]))
+
+            hH, hW, _ = hair.shape
+
+            # -------------------------------------------------------------------------------------
+            # 1. Resize hair if bigger than target image
+            # -------------------------------------------------------------------------------------
+            if hH > H or hW > W:
+                scale = min(H / hH, W / hW) * random.uniform(0.5, 0.9)
+                new_hH = max(1, int(hH * scale))
+                new_hW = max(1, int(hW * scale))
+                hair = cv2.resize(hair, (new_hW, new_hH), interpolation=cv2.INTER_AREA)
+                hH, hW = new_hH, new_hW
+
+            # -------------------------------------------------------------------------------------
+            # 2. Ensure valid placement
+            # -------------------------------------------------------------------------------------
+            if H - hH <= 0 or W - hW <= 0:
+                continue  # Skip hair if still too big
+
+            roi_y = random.randint(0, H - hH)
+            roi_x = random.randint(0, W - hW)
+
+            roi = image[roi_y:roi_y + hH, roi_x:roi_x + hW]
+
+            # -------------------------------------------------------------------------------------
+            # 3. Normal hair blending with mask
+            # -------------------------------------------------------------------------------------
+            img2gray = cv2.cvtColor(hair, cv2.COLOR_RGB2GRAY)
+            _, mask = cv2.threshold(img2gray, 10, 255, cv2.THRESH_BINARY)
+            mask_inv = cv2.bitwise_not(mask)
+
+            bg = cv2.bitwise_and(roi, roi, mask=mask_inv)
+            fg = cv2.bitwise_and(hair, hair, mask=mask)
+            blended = cv2.add(bg, fg)
+
+            image[roi_y:roi_y + hH, roi_x:roi_x + hW] = blended
+
+        return image
+
+class Microscope(A.ImageOnlyTransform):
+    def __init__(self, p=0.5, always_apply=False):
+        super().__init__(always_apply, p)
+
+    def apply(self, img):
+        # Random skip based on probability
+        if random.random() >= self.p:
+            return img
+
+        h, w = img.shape[:2]
+
+        # --- Create a white mask (255 everywhere) ---
+        circle_img = np.ones((h, w), dtype=np.uint8) * 255
+
+        # --- Draw a black circle in the center ---
+        center = (h // 2, w // 2)
+        radius = random.randint(h // 2 - 3, h // 2 + 15)
+        cv2.circle(circle_img, center, radius, 0, -1)
+
+        # --- Convert to a binary mask (0 inside circle, 1 outside) ---
+        mask = (circle_img == 0).astype(np.uint8)
+
+        # --- Ensure the mask has 3 channels ---
+        mask = np.repeat(mask[:, :, None], 3, axis=2)
+
+        # --- Apply mask: darken the center region ---
+        img_masked = img * mask
+
+        return img_masked.astype(np.uint8)
 
 class MetadataProcessor:
     """
-    Metadata processor for ISIC multimodal training.
-    Supports both numeric and categorical metadata.
-
-    Features:
-    - One-hot encode categorical variables (or 0/1 for binary)
-    - Normalize numeric variables using mean/std from TRAIN
-    - Guarantees consistent ordering between train/val/test
+    Processor for tabular metadata (numeric + categorical) with:
+      - Multivariate imputation for numeric features (IterativeImputer)
+      - Normalization (z‑score) of numeric features
+      - Imputation of categorical NaNs (fill with "Missing") + one-hot encoding
+      - Consistent output shape/order between train / val / test
     """
 
-    def __init__(self, feature_list: list):
+    def __init__(self, feature_list: list, categorical_as_str: bool = True, imputer_kwargs: dict = None):
         """
-        feature_list : list of features to use (numeric or categorical)
+        feature_list: list of feature names (columns) to use.
+        categorical_as_str: if True, convert categorical features to str before encoding (to handle NaNs).
+        imputer_kwargs: arguments passed to IterativeImputer (e.g. random_state, max_iter).
         """
         self.features = feature_list
-    
-    def fit(self, train_df: pd.DataFrame):
+        self.categorical_as_str = categorical_as_str
+        self.num_features = 0
+        # default imputer parameters
+        self.imputer_kwargs = imputer_kwargs or {'random_state': 0, 'max_iter': 10}
+
+    def fit(self, df: pd.DataFrame):
+        df = df.copy()
+        df = df[self.features]
+
         # Separate numeric and categorical
         self.numeric_features = [
-            f for f in self.features if np.issubdtype(train_df[f].dtype, np.number)
-        ]
+            f for f in self.features if np.issubdtype(df[f].dtype, np.number)]
         self.categorical_features = [
-            f for f in self.features if f not in self.numeric_features
-        ]
+            f for f in self.features if f not in self.numeric_features]
 
-        # ----- Numeric normalization and missing indicators -----
-        self.numeric_means = {}
-        self.numeric_stds = {}
-        for f in self.numeric_features:
-            col = pd.to_numeric(train_df[f], errors='coerce')
-            self.numeric_means[f] = col.mean()
-            self.numeric_stds[f] = col.std() if col.std() > 0 else 1.0  # avoid div by zero
+        # Fit imputer + scaler for numeric
+        if self.numeric_features:
+            self.imputer_ = IterativeImputer(**self.imputer_kwargs)
+            self.imputer_.fit(df[self.numeric_features])
 
-        # ----- Categorical one-hot mapping -----
-        self.categorical_columns = {}
+            # After imputing, compute scaler (on imputed values)
+            imputed = self.imputer_.transform(df[self.numeric_features])
+            self.scaler_ = StandardScaler().fit(imputed)
+
+        # Prepare dummy columns for categorical features
+        self.cat_dummy_columns_ = {}
         for f in self.categorical_features:
-            dummies = pd.get_dummies(
-                train_df[f], prefix=f, dummy_na=True
-            )
-            self.categorical_columns[f] = dummies.columns.tolist()
+            ser = df[f].fillna("Missing").astype(str) if self.categorical_as_str else df[f]
+            dummies = pd.get_dummies(ser, prefix=f)
+            self.cat_dummy_columns_[f] = dummies.columns.tolist()
 
-    def process_metadata(self, df: pd.DataFrame) -> np.ndarray:
-        """
-        Transform metadata:
-        - normalize numeric with missing indicators
-        - one-hot encode categorical features
-        - maintain consistent column ordering
-        """
-        processed = []
+    def transform(self, df: pd.DataFrame) -> np.ndarray:
+        df = df.copy()
+        df = df[self.features]
 
-        # ----- Numeric -----
-        for f in self.numeric_features:
-            if f in df.columns:
-                col = pd.to_numeric(df[f], errors='coerce')
+        parts = []
 
-                # Missing indicator
-                missing_indicator = col.isna().astype(np.float32).values.reshape(-1, 1)
-                processed.append(missing_indicator)
+        # Numeric: impute then scale
+        if self.numeric_features:
+            num = df[self.numeric_features]
+            num_imp = self.imputer_.transform(num)
+            num_scaled = self.scaler_.transform(num_imp)
+            parts.append(num_scaled.astype(np.float32))
 
-                # Fill missing
-                col = col.fillna(self.numeric_means[f])
-
-                # Normalize
-                z = ((col - self.numeric_means[f]) / self.numeric_stds[f]).values.reshape(-1, 1).astype(np.float32)
-                processed.append(z)
-
-        # ----- Categorical -----
+        # Categorical: fillna + one-hot, ensure same columns
         for f in self.categorical_features:
-            if f in df.columns:
-                dummies = pd.get_dummies(df[f], prefix=f, dummy_na=True)
-                expected_cols = self.categorical_columns[f]
+            ser = df[f].fillna("Missing").astype(str) if self.categorical_as_str else df[f]
+            dummies = pd.get_dummies(ser, prefix=f)
+            cols = self.cat_dummy_columns_[f]
 
-                # Efficiently add missing columns in one shot
-                missing_cols = [c for c in expected_cols if c not in dummies.columns]
-                if missing_cols:
-                    add_df = pd.DataFrame(
-                        0, 
-                        index=dummies.index, 
-                        columns=missing_cols
-                    )
-                    dummies = pd.concat([dummies, add_df], axis=1)
+            # Reindex to ensure all expected columns exist; fill missing with 0
+            dummies = dummies.reindex(columns=cols, fill_value=0)
+            parts.append(dummies.values.astype(np.float32))
 
-                # Reorder
-                dummies = dummies[expected_cols]
-                processed.append(dummies.values.astype(np.float32))
-
-        # ----- Concatenate -----
-        if processed:
-            return np.concatenate(processed, axis=1)
+        if parts:
+            concatenated_parts = np.concatenate(parts, axis=1)
+            self.num_features = concatenated_parts.shape[1]
+            return concatenated_parts
         else:
-            return np.zeros((len(df), 1), dtype=np.float32)
+            return np.zeros((len(df), 0), dtype=np.float32)
+
+    def fit_transform(self, df: pd.DataFrame) -> np.ndarray:
+        self.fit(df)
+        return self.transform(df)
+
+################################################################################
+                            # TRAIN FUNCTIONS #
+################################################################################
+
+def pretrain_metadata_model(train_df,
+                            metadata_processor=None,
+                            n_splits=5,
+                            save_path=None,
+                            verbose=True):
+    """
+    Pretrains a metadata model using LightGBM + Optuna.
+    If save_path exists, loads model/processor from disk instead of retraining.
+    """
+
+    # -------------------------------------------------
+    # 1) LOAD FROM DISK IF AVAILABLE
+    # -------------------------------------------------
+    warnings.filterwarnings("ignore", category=UserWarning)
+    if os.path.exists(save_path):
+        if verbose:
+            print(f"Loading pretrained metadata model from: {save_path}")
+
+        saved = joblib.load(save_path)
+        return saved
+
+    X = metadata_processor.transform(train_df)
+    y = train_df["target"].values
+
+    # --------------------------
+    # Optuna objective
+    # --------------------------
+    def objective(trial):
+        params = {
+            "objective": "binary",
+            "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.2),
+            "num_leaves": trial.suggest_int("num_leaves", 16, 64),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+            "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+            "reg_lambda": trial.suggest_float("reg_lambda", 0.0, 10.0),
+            "min_child_samples": trial.suggest_int("min_child_samples", 5, 40),
+        }
+
+        kf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+        aucs = []
+
+        for tr_idx, val_idx in kf.split(X, y):
+            model = lgb.LGBMClassifier(**params, n_jobs=-1, verbosity=-1)
+
+            model.fit(
+                X[tr_idx],
+                y[tr_idx],
+                eval_set=[(X[val_idx], y[val_idx])],
+                eval_metric="auc",
+            )
+
+            preds = model.predict_proba(X[val_idx])[:, 1]
+            aucs.append(roc_auc_score(y[val_idx], preds))
+
+        mean_auc = float(np.mean(aucs))
+
+        if verbose:
+            print(f"Trial {trial.number:02d} → AUC: {mean_auc:.5f}")
+
+        return mean_auc
+
+    # --------------------------
+    # Run search
+    # --------------------------
+    if verbose:
+        print("\nSearching hyperparameters...\n")
+
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=30, show_progress_bar=verbose)
+
+    best_params = study.best_params
+
+    if verbose:
+        print("\nBest parameters:", best_params)
+        print(f"Best CV AUC: {study.best_value:.5f}")
+
+    # --------------------------
+    # Train final model
+    # --------------------------
+    final_model = lgb.LGBMClassifier(**best_params,  verbosity=-1)
+    final_model.fit(X, y)
+
+    # -------------------------------------------------
+    # 3) Save using joblib
+    # -------------------------------------------------
+    leaf_indices_train = final_model.predict(X, pred_leaf=True)
+    leaf_dim = leaf_indices_train.max() + 1
+    joblib.dump(final_model, save_path)
+
+    return final_model
     
 class PositiveOversampler(Sampler):
     """
@@ -458,8 +676,13 @@ class TrainableModule():
         self.early_stop = False
         self.best_state_dict = None
 
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.3)  # gain pequeño
+                nn.init.zeros_(m.bias)
+
         # AMP
-        self.scaler = amp.GradScaler() if device.type == "cuda" else None
+        # self.scaler = amp.GradScaler() if device.type == "cuda" else None
 
     # -------------------------------------------------------------
     def _train_epoch(self, loader):
@@ -477,18 +700,18 @@ class TrainableModule():
 
             self.optimizer.zero_grad()
 
-            with torch.amp.autocast(device_type=self.device.type):  # AMP
-                preds = self(images, metadata).view(-1)
-                loss = self.criterion(preds, labels)
+            # with torch.amp.autocast(device_type=self.device.type):  # AMP
+            preds = self(images, metadata).view(-1)
+            loss = self.criterion(preds, labels)
 
             # AMP scaled backward
-            if self.scaler is not None:
-                self.scaler.scale(loss).backward()
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                loss.backward()
-                self.optimizer.step()
+            # if self.scaler is not None:
+            #     self.scaler.scale(loss).backward()
+            #     self.scaler.step(self.optimizer)
+            #     self.scaler.update()
+            # else:
+            loss.backward()
+            self.optimizer.step()
 
             total_loss += loss.item()
 
@@ -508,9 +731,9 @@ class TrainableModule():
                 metadata = metadata.to(self.device, non_blocking=True)
                 labels = labels.float().to(self.device, non_blocking=True)
 
-                with torch.amp.autocast(device_type=self.device.type):  # AMP
-                    preds = self(images, metadata).view(-1)
-                    loss = self.criterion(preds, labels)
+                # with torch.amp.autocast(device_type=self.device.type):  # AMP
+                preds = self(images, metadata).view(-1)
+                loss = self.criterion(preds, labels)
                 total_loss += loss.item()
 
                 preds_list.append(preds.cpu())
@@ -591,6 +814,10 @@ class TrainableModule():
         print(f"Saved model with val_auc {self.best_model_AUC}")
         torch.save(self.best_model, path)
     
+################################################################################
+                        # DATA PROCESSING #
+################################################################################
+
 class ISIC_Multimodal_Dataset(Dataset):
     """
     PyTorch Dataset wrapper for ISIC HDF5 images and clinical metadata.
@@ -610,24 +837,16 @@ class ISIC_Multimodal_Dataset(Dataset):
             Table with image IDs, labels, and metadata.
         image_transform : callable, optional
             Preprocessing transforms for all images.
-        data_augmentation_trans : callable, optional
-            Augmentations applied dynamically to positive samples.
-        augment_positives : bool, default=False
-            Enables positive-sample augmentation.
 
     Notes:
     - Original images remain unchanged; augmentations occur during __getitem__.
     - Stats from `get_dataset_stats()` are useful for analyzing train/val/test splits.
     """
     def __init__(self, hdf5_path: str, metadata_df: pd.DataFrame,
-                 image_transform, metadata_processor: MetadataProcessor, 
-                 data_augmentation_trans = None,
-                 augment_positives:bool=False):
+                 image_transform, metadata_processor: MetadataProcessor):
         
-        self.augment_trans = data_augmentation_trans    # transformation to data augmentation
-        self.prep_trans = image_transform               # transformation base
+        self.image_transform = image_transform
         self.metadata_processor = metadata_processor
-        self.augment_positives = augment_positives    # apply dinamic transformations
 
         # 1º Read the metadata
         self.metadata = metadata_df
@@ -638,7 +857,7 @@ class ISIC_Multimodal_Dataset(Dataset):
         self.hdf5_file = h5py.File(hdf5_path, "r")
 
         # 3º Preprocess the metadata
-        self.metadata_features = self.metadata_processor.process_metadata(self.metadata)
+        self.metadata_features = self.metadata_processor.transform(self.metadata)
 
 
     def __len__(self):
@@ -650,14 +869,8 @@ class ISIC_Multimodal_Dataset(Dataset):
         
         # Load and transform image
         image_rgb = self._load_image_from_hdf5(isic_id)
-        
-        # Dynamic positive augmentation
-        image_pil = F_v.to_pil_image(image_rgb)
-        
-        if self.augment_positives and self.is_labelled and row["target"] == 1:
-            image = self.augment_trans(image_pil)
-        else:
-            image = self.prep_trans(image_pil)
+        image_aug = self.image_transform(image=image_rgb)['image']
+        image = torch.from_numpy(image_aug).permute(2, 0, 1).float()
 
         # Metadata
         metadata = torch.FloatTensor(self.metadata_features[idx])
@@ -719,12 +932,11 @@ class ISIC_Multimodal_Dataset(Dataset):
         for isic_id in sample_ids:
             img = self._load_image_from_hdf5(isic_id)
 
-            if self.prep_trans:
-                img_t = self.prep_trans(F_v.to_pil_image(img))
-                img = img_t.permute(1, 2, 0).numpy()
+            img = self.image_transform(image=img)["image"]
+            img = torch.from_numpy(img).permute(2, 0, 1).float()
 
-            means.append(img.mean(axis=(0, 1)))
-            stds.append(img.std(axis=(0, 1)))
+            means.append(img.mean(dim=(1, 2)).cpu().numpy())
+            stds.append(img.std(dim=(1, 2)).cpu().numpy())
 
         means = np.array(means)
         stds = np.array(stds)
