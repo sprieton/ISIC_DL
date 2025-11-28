@@ -1,32 +1,31 @@
 import h5py
 import cv2
 import os
+import gc
 import random
-import numpy as np
-import pandas as pd
-import torch
-from albumentations.core.transforms_interface import ImageOnlyTransform
-import albumentations as A
-from tqdm import tqdm
-import torch.nn as nn
-from torch.optim import AdamW
-from sklearn.metrics import roc_auc_score
-from torch.utils.data import Sampler
-from torch.utils.data import Dataset
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.preprocessing import LabelEncoder
-from sklearn.model_selection import GridSearchCV
-from sklearn.preprocessing import StandardScaler
-import matplotlib.pyplot as plt
-from sklearn.experimental import enable_iterative_imputer
-from sklearn.impute import IterativeImputer
-import optuna
-import lightgbm as lgb
-import numpy as np
-from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import roc_auc_score
 import joblib
 import warnings
+import optuna
+import copy
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import lightgbm as lgb
+from tqdm import tqdm
+import albumentations as A
+from albumentations.core.transforms_interface import ImageOnlyTransform
+
+import torch
+import torch.nn as nn
+from torch.optim import AdamW
+from torch.utils.data import Sampler, Dataset, DataLoader, WeightedRandomSampler
+from sklearn.metrics import roc_auc_score, confusion_matrix, ConfusionMatrixDisplay
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.model_selection import train_test_split, GridSearchCV, StratifiedKFold
+from sklearn.experimental import enable_iterative_imputer
+from sklearn.impute import IterativeImputer
+
 
 
 
@@ -43,6 +42,56 @@ def make_sampler_weights(targets, p_target):
     sample_weights = np.array([class_weights[int(t)] for t in targets], dtype=float)
     
     return sample_weights
+
+def get_fold_datalodaers(train_df, validation_df, train_hdf5, train_transform,
+                         validation_transform, metadata_processor, c1_prop, 
+                         num_img_epoch, batch_size, device):
+    # get the datasets for the selected index
+    train_dataset = ISIC_Multimodal_Dataset(
+        hdf5_path=train_hdf5,
+        metadata_df=train_df,
+        image_transform=train_transform,
+        metadata_processor=metadata_processor
+    )
+
+    val_dataset = ISIC_Multimodal_Dataset(
+        hdf5_path=train_hdf5,
+        metadata_df=validation_df,
+        image_transform=validation_transform,
+        metadata_processor=metadata_processor
+    )
+
+    # Get the weights for the sampler
+    multimodal_train_targets = train_dataset.metadata['target'].values
+    sample_weights = make_sampler_weights(
+        multimodal_train_targets, 
+        c1_prop)
+
+    # Create the weighted sampler with the calculated weights
+    multimodal_weighted_sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=num_img_epoch,
+        replacement=True
+    )
+
+    # Create data loaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        sampler=multimodal_weighted_sampler,
+        num_workers=4,
+        pin_memory=True if device == 'cuda' else False
+    )
+
+    valid_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True if device == 'cuda' else False
+    )
+
+    return train_loader, valid_loader
 
 def remove_last_layer(model):
     """
@@ -118,8 +167,6 @@ def create_balanced_split(metadataCSV_path: str, neg_multiplier: int = 10,
     print(df_balanced['target'].value_counts())
 
     # 4. Stratified train/validation split
-    from sklearn.model_selection import train_test_split
-
     train_df, val_df = train_test_split(
         df_balanced,
         test_size=val_frac,
@@ -282,6 +329,29 @@ def plot_stats(stats_dicts, labels=["Train", "Validation", "Test"]):
 
     plt.tight_layout()
     plt.show()
+
+def plot_confusion_matrix(model_name, preds, labels):
+    # calculate the confusion matrix
+    cm = confusion_matrix(labels, preds)
+
+    plt.figure(figsize=(6, 5))
+    ax = plt.gca()
+
+    colors = ["viridis", "Blues", "magma", "plasma", "inferno", "cividis", "turbo"]
+
+    cmap = random.choice(colors)
+
+
+    # Display
+    cm_display = ConfusionMatrixDisplay(
+        confusion_matrix=cm,
+        display_labels=['Benign', 'Malignant']
+    )
+
+    cm_display.plot(ax=ax, cmap=cmap, values_format='d')
+    plt.title(f"{model_name} | {roc_auc_score(labels, preds):.3f}")
+    plt.show()
+
 
 def get_best_metadata(train_df: pd.DataFrame, test_df: pd.DataFrame, 
                       num_feat=0, verbose=False):
@@ -666,32 +736,19 @@ class TrainableModule():
             mode='max',            # maximize AUC
             factor=0.5,
             patience=2,
-            min_lr=1e-7,
-            verbose=True
+            min_lr=1e-7
         )
-
-        
+        self.save_dict = {}
         self.best_model = None
         self.best_model_AUC = 0
 
         # metrics
         self.history = {}
 
-        # Early stopping
-        self.patience = patience
-        self.min_delta = min_delta
-        self.best_score = None
-        self.counter = 0
-        self.early_stop = False
-        self.best_state_dict = None
-
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight, gain=0.3)  # gain pequeño
                 nn.init.zeros_(m.bias)
-
-        # AMP
-        # self.scaler = amp.GradScaler() if device.type == "cuda" else None
 
     # -------------------------------------------------------------
     def _train_epoch(self, loader):
@@ -713,17 +770,11 @@ class TrainableModule():
             preds = self(images, metadata).view(-1)
             loss = self.criterion(preds, labels)
 
-            # AMP scaled backward
-            # if self.scaler is not None:
-            #     self.scaler.scale(loss).backward()
-            #     self.scaler.step(self.optimizer)
-            #     self.scaler.update()
-            # else:
             loss.backward()
             self.optimizer.step()
 
             total_loss += loss.item()
-
+            
         return total_loss / len(loader), pos_labels / total_elem
 
     # -------------------------------------------------------------
@@ -740,7 +791,6 @@ class TrainableModule():
                 metadata = metadata.to(self.device, non_blocking=True)
                 labels = labels.float().to(self.device, non_blocking=True)
 
-                # with torch.amp.autocast(device_type=self.device.type):  # AMP
                 preds = self(images, metadata).view(-1)
                 loss = self.criterion(preds, labels)
                 total_loss += loss.item()
@@ -751,6 +801,13 @@ class TrainableModule():
         preds = torch.cat(preds_list).sigmoid().numpy()
         labels = torch.cat(labels_list).numpy()
         auc = roc_auc_score(labels, preds)
+
+        # save the best model
+        if auc > self.best_model_AUC:
+            self.best_model_AUC = auc
+            self.best_model = copy.deepcopy(self.state_dict())
+            
+
         self.scheduler.step(auc)
 
         return total_loss / len(loader), auc
@@ -785,10 +842,10 @@ class TrainableModule():
                 metadata = metadata.to(self.device, non_blocking=True)
                 labels = labels.float()
 
-                preds_logits = self(images, metadata).view(-1)
+                preds_logits = self(images, metadata).squeeze(dim=1)
                 probs = torch.sigmoid(preds_logits)
 
-                labels_list.append(labels)
+                labels_list.append(labels.cpu())
                 probs_list.append(probs.cpu())
 
         labels = torch.cat(labels_list).numpy()
@@ -797,27 +854,6 @@ class TrainableModule():
 
         return labels, preds, probs
 
-    # -------------------------------------------------------------
-    def _check_early_stopping(self, score):
-
-        if self.best_score is None:
-            self.best_score = score
-            self.best_state_dict = {k: v.cpu().clone() for k, v in self.state_dict().items()}
-            return False
-
-        # Check if we improve the results over the last epoch and some margin
-        if score <= self.best_score - self.min_delta:
-            self.best_score = score
-            self.best_state_dict = {k: v.cpu().clone() for k, v in self.state_dict().items()}
-            self.counter = 0
-        else:
-            self.counter += 1
-
-            # if we dont improve in n epoch we get out            
-            if self.counter >= self.patience:
-                return True
-
-        return False
 
     # -------------------------------------------------------------
     def submit_kaggle(self, test_loader, submission_file="submission.csv"):
@@ -844,7 +880,6 @@ class TrainableModule():
                 images = images.to(self.device, non_blocking=True)
                 metadata = metadata.to(self.device, non_blocking=True)
 
-                # with amp.autocast(device_type=self.device.type):  # AMP
                 logits = self(images, metadata).squeeze()
                 probs = torch.sigmoid(logits)
                 
@@ -852,17 +887,25 @@ class TrainableModule():
                 for isic_id, p in zip(isic_ids, probs):
                     predictions.append({"isic_id": isic_id, "target": float(p)})
 
+                # del images, metadata, logits, probs
+                # torch.cuda.empty_cache()
+                # gc.collect()
         submission_df = pd.DataFrame(predictions)
         submission_df = submission_df.sort_values(by="isic_id").reset_index(drop=True)
         submission_df.to_csv(submission_file, index=False)
 
         print(f"Saved submission with {len(submission_df)} rows to {submission_file}")
-        display(submission_df.head(10))
 
     # -------------------------------------------------------------
     def save(self, path):
         print(f"Saved model with val_auc {self.best_model_AUC}")
         torch.save(self.best_model, path)
+    
+    def load(self, path, device='cpu'):
+        state_dict = torch.load(path, map_location=device)
+        self.load_state_dict(state_dict)
+        self.to(device)
+        self.eval()
     
 ################################################################################
                         # DATA PROCESSING #
