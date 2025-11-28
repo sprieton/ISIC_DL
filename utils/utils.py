@@ -1,11 +1,7 @@
 import h5py
 import cv2
 import os
-import gc
 import random
-import joblib
-import warnings
-import optuna
 import copy
 import numpy as np
 import pandas as pd
@@ -18,11 +14,11 @@ from albumentations.core.transforms_interface import ImageOnlyTransform
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-from torch.utils.data import Sampler, Dataset, DataLoader, WeightedRandomSampler
-from sklearn.metrics import roc_auc_score, confusion_matrix, ConfusionMatrixDisplay
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from sklearn.metrics import roc_auc_score, confusion_matrix, roc_curve, ConfusionMatrixDisplay
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.model_selection import train_test_split, GridSearchCV, StratifiedKFold
+from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.experimental import enable_iterative_imputer
 from sklearn.impute import IterativeImputer
 
@@ -330,28 +326,43 @@ def plot_stats(stats_dicts, labels=["Train", "Validation", "Test"]):
     plt.tight_layout()
     plt.show()
 
-def plot_confusion_matrix(model_name, preds, labels):
-    # calculate the confusion matrix
-    cm = confusion_matrix(labels, preds)
-
-    plt.figure(figsize=(6, 5))
-    ax = plt.gca()
-
+def plot_analisis(model_name, labels, probs, fold_num=0):
+    roc = roc_auc_score(labels, probs)
     colors = ["viridis", "Blues", "magma", "plasma", "inferno", "cividis", "turbo"]
-
     cmap = random.choice(colors)
 
+    fig = plt.figure(figsize=(12, 5))
+    fig.suptitle(f"{model_name}_f{fold_num} | AUC={roc:.3f}", fontsize=14)
+    
+    # ---------- Plot ROC AUC curve ------------
+    plt.subplot(1, 2, 1)
+    plt.title(f"ROC curve ({roc:.4})")
+    fpr, tpr, thresholds = roc_curve(labels, probs)
+    plt.plot(fpr, tpr, color='blue', lw=2)
+    plt.plot([0, 1], [0, 1], color='gray', linestyle='--') # Línea base aleatoria
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('Tasa de Falsos Positivos (FPR)')
+    plt.ylabel('Tasa de Verdaderos Positivos (TPR)')
+    plt.grid(True, alpha=0.3)
 
-    # Display
+    # ---------- Confusion matrix plot ---------------
+    # get best threshold by Youden J
+    J = tpr - fpr
+    ix = np.argmax(J)
+    best_threshold = thresholds[ix]
+    preds = (probs >= best_threshold).astype(int)
+    cm = confusion_matrix(labels, preds)
+
+    plt.subplot(1, 2, 2)
+    ax = plt.gca()
     cm_display = ConfusionMatrixDisplay(
         confusion_matrix=cm,
-        display_labels=['Benign', 'Malignant']
-    )
-
+        display_labels=['Benign', 'Malignant'])
     cm_display.plot(ax=ax, cmap=cmap, values_format='d')
-    plt.title(f"{model_name} | {roc_auc_score(labels, preds):.3f}")
+    plt.title(f"Confusion Matrix")
+    plt.tight_layout()
     plt.show()
-
 
 def get_best_metadata(train_df: pd.DataFrame, test_df: pd.DataFrame, 
                       num_feat=0, verbose=False):
@@ -601,128 +612,7 @@ class MetadataProcessor:
 ################################################################################
                             # TRAIN FUNCTIONS #
 ################################################################################
-
-def pretrain_metadata_model(train_df,
-                            metadata_processor=None,
-                            n_splits=5,
-                            save_path=None,
-                            verbose=True):
-    """
-    Pretrains a metadata model using LightGBM + Optuna.
-    If save_path exists, loads model/processor from disk instead of retraining.
-    """
-
-    # -------------------------------------------------
-    # 1) LOAD FROM DISK IF AVAILABLE
-    # -------------------------------------------------
-    warnings.filterwarnings("ignore", category=UserWarning)
-    if os.path.exists(save_path):
-        if verbose:
-            print(f"Loading pretrained metadata model from: {save_path}")
-
-        saved = joblib.load(save_path)
-        return saved
-
-    X = metadata_processor.transform(train_df)
-    y = train_df["target"].values
-
-    # --------------------------
-    # Optuna objective
-    # --------------------------
-    def objective(trial):
-        params = {
-            "objective": "binary",
-            "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.2),
-            "num_leaves": trial.suggest_int("num_leaves", 16, 64),
-            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
-            "subsample": trial.suggest_float("subsample", 0.5, 1.0),
-            "reg_lambda": trial.suggest_float("reg_lambda", 0.0, 10.0),
-            "min_child_samples": trial.suggest_int("min_child_samples", 5, 40),
-        }
-
-        kf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-        aucs = []
-
-        for tr_idx, val_idx in kf.split(X, y):
-            model = lgb.LGBMClassifier(**params, n_jobs=-1, verbosity=-1)
-
-            model.fit(
-                X[tr_idx],
-                y[tr_idx],
-                eval_set=[(X[val_idx], y[val_idx])],
-                eval_metric="auc",
-            )
-
-            preds = model.predict_proba(X[val_idx])[:, 1]
-            aucs.append(roc_auc_score(y[val_idx], preds))
-
-        mean_auc = float(np.mean(aucs))
-
-        if verbose:
-            print(f"Trial {trial.number:02d} → AUC: {mean_auc:.5f}")
-
-        return mean_auc
-
-    # --------------------------
-    # Run search
-    # --------------------------
-    if verbose:
-        print("\nSearching hyperparameters...\n")
-
-    study = optuna.create_study(direction="maximize")
-    study.optimize(objective, n_trials=30, show_progress_bar=verbose)
-
-    best_params = study.best_params
-
-    if verbose:
-        print("\nBest parameters:", best_params)
-        print(f"Best CV AUC: {study.best_value:.5f}")
-
-    # --------------------------
-    # Train final model
-    # --------------------------
-    final_model = lgb.LGBMClassifier(**best_params,  verbosity=-1)
-    final_model.fit(X, y)
-
-    # -------------------------------------------------
-    # 3) Save using joblib
-    # -------------------------------------------------
-    leaf_indices_train = final_model.predict(X, pred_leaf=True)
-    leaf_dim = leaf_indices_train.max() + 1
-    joblib.dump(final_model, save_path)
-
-    return final_model
-    
-class PositiveOversampler(Sampler):
-    """
-    Custom PyTorch Sampler to oversample positive class examples in a dataset.
-
-    Parameters
-    ----------
-    dataset : torch.utils.data.Dataset
-        The dataset containing a 'target' column in `dataset.metadata`.
-    
-    pos_multiplier : int, default=3
-        Number of times to repeat each positive sample in the sampler
-    """
-
-    def __init__(self, dataset, pos_multiplier=3):
-        self.dataset = dataset
-        self.pos_multiplier = pos_multiplier
-        self.indices = []
-        for idx, row in dataset.metadata.iterrows():
-            if row['target'] == 1:
-                self.indices.extend([idx]*pos_multiplier)
-            else:
-                self.indices.append(idx)
-
-    def __iter__(self):
-        np.random.shuffle(self.indices)
-        return iter(self.indices)
-
-    def __len__(self):
-        return len(self.indices)
-    
+ 
 class TrainableModule():
     def __init__(self, criterion, device, patience, min_delta):
 
@@ -812,7 +702,7 @@ class TrainableModule():
 
         return total_loss / len(loader), auc
     # -------------------------------------------------------------
-    def pred_probs(self, loader, threshold=0.5):
+    def pred_probs(self, loader):
         """
         Return predictions and labels for a given dataloader.
 
@@ -820,9 +710,6 @@ class TrainableModule():
         ----------
         loader : DataLoader
             PyTorch DataLoader for validation/test.
-        threshold : float, default=0.5
-            Threshold for converting probabilities to binary predictions.
-
         Returns
         -------
         labels : np.ndarray
@@ -850,9 +737,8 @@ class TrainableModule():
 
         labels = torch.cat(labels_list).numpy()
         probs = torch.cat(probs_list).numpy()
-        preds = (probs >= threshold).astype(int)
 
-        return labels, preds, probs
+        return labels, probs
 
 
     # -------------------------------------------------------------
@@ -887,9 +773,6 @@ class TrainableModule():
                 for isic_id, p in zip(isic_ids, probs):
                     predictions.append({"isic_id": isic_id, "target": float(p)})
 
-                # del images, metadata, logits, probs
-                # torch.cuda.empty_cache()
-                # gc.collect()
         submission_df = pd.DataFrame(predictions)
         submission_df = submission_df.sort_values(by="isic_id").reset_index(drop=True)
         submission_df.to_csv(submission_file, index=False)
